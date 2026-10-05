@@ -4,7 +4,7 @@ import triton.language as tl
 import math
 
 @triton.jit
-def _flash_attention_forward_causal_kernel (
+def _flash_attention_forward_gqa_kernel (
     # Pointers to Tensors
     Q_ptr, K_ptr, V_ptr, O_ptr,
     # Stride information for tensors
@@ -14,23 +14,26 @@ def _flash_attention_forward_causal_kernel (
     # Kernel parameters
     softmax_scale,
     SEQ_LEN,
-    N_HEADS,
+    N_Q_HEADS,
+    N_KV_HEADS,
     HEAD_DIM: tl.constexpr,
     BLOCK_Q: tl.constexpr, # Number of query rows one program instance handles
     BLOCK_K: tl.constexpr # Number of key/value rows loaded in each iteration of the inner loop
     # Each step creates a score tile s_ij of shape [BLOCK_Q, BLOCK_K]
 ):
     """
-    Triton implementation of causal FlashAttention-2 forward pass 
+    Triton implementation of causal FlashAttention-2 forward pass with Grouped Query Attention (GQA)
     """
-    
+    q_group_size = N_Q_HEADS // N_KV_HEADS
 
-    # 1. Identify the query block and batch/head to be processed
+    # 1. Identify the query block and batch/query head/kv head to be processed
     q_block_idx = tl.program_id(axis=0)
     batch_head_idx = tl.program_id(axis=1)
 
-    batch_idx = batch_head_idx // N_HEADS
-    head_idx = batch_head_idx % N_HEADS
+    batch_idx = batch_head_idx // N_Q_HEADS
+    q_head_idx = batch_head_idx % N_Q_HEADS
+    # Identify KV head index to be processed
+    kv_head_idx = q_head_idx // q_group_size
 
     # 2. Initialize pointers and accumulators for the online softmax
     m_i = tl.full((BLOCK_Q,), float('-inf'), dtype=tl.float32)
@@ -39,11 +42,11 @@ def _flash_attention_forward_causal_kernel (
 
     # 3. Load the block of queries (Q_i)
     q_offsets = q_block_idx * BLOCK_Q + tl.arange(0, BLOCK_Q) # roughly, the role of seq_idx
-    q_ptrs = Q_ptr + batch_idx * q_stride_b + head_idx * q_stride_h \
+    q_ptrs = Q_ptr + batch_idx * q_stride_b + q_head_idx * q_stride_h \
         + (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
     q_block = tl.load(q_ptrs, mask=(q_offsets[:,None] < SEQ_LEN), other=0.0)
 
-    # PyTorch softmax is exp(x). Triton exp2 is exp2(x * log2(e)) and used for speedup; log2(e) is approx 1.44269504
+    # PyTorch softmax is exp(x). Triton exp is exp2(x * log2(e)) and used for speedup; log2(e) is approx 1.44269504
     score_scale = softmax_scale * 1.44269504
 
     # Main loop: iterate over the blocks of Keys (K_j) and Values (V_j)
@@ -55,7 +58,7 @@ def _flash_attention_forward_causal_kernel (
     for k_start in range(0, diag_start_idx, BLOCK_K):
         # Load the block of keys (K_j)
         k_offsets = k_start + tl.arange(0, BLOCK_K)
-        k_ptrs = K_ptr + batch_idx * k_stride_b + head_idx * k_stride_h \
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h \
             + (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None]) # Shape [HEAD_DIM, BLOCK_K]
         k_block = tl.load(k_ptrs, mask=(k_offsets[None, :] < SEQ_LEN), other=0.0) # Transposed key block
 
@@ -64,7 +67,7 @@ def _flash_attention_forward_causal_kernel (
         scores = tl.where(k_offsets[None, :] < SEQ_LEN, scores, float('-inf'))
 
         # Load the block of values (V_j)
-        v_ptrs = V_ptr + batch_idx * v_stride_b + head_idx * v_stride_h \
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h \
             + (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
         v_block = tl.load(v_ptrs, mask=(k_offsets[:, None] < SEQ_LEN), other=0.0)
 
@@ -92,7 +95,7 @@ def _flash_attention_forward_causal_kernel (
 
         # Load the block of keys (K_j)
         k_offsets = k_start + tl.arange(0, BLOCK_K)
-        k_ptrs = K_ptr + batch_idx * k_stride_b + head_idx * k_stride_h \
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h \
             + (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None]) # Shape [HEAD_DIM, BLOCK_K]
         k_block = tl.load(k_ptrs, mask=(k_offsets[None, :] < SEQ_LEN), other=0.0) # Transposed key block
 
@@ -102,7 +105,7 @@ def _flash_attention_forward_causal_kernel (
         scores = tl.where(causal_mask, scores, float('-inf'))
 
         # Load the block of values (V_j)
-        v_ptrs = V_ptr + batch_idx * v_stride_b + head_idx * v_stride_h \
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h \
             + (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
         v_block = tl.load(v_ptrs, mask=(k_offsets[:, None] < SEQ_LEN), other=0.0)
 
@@ -133,7 +136,7 @@ def _flash_attention_forward_causal_kernel (
     # We skip computing and saving logsumexp L_i (until we write the backward pass)
 
     # Save o_i to the HBM
-    o_block = O_ptr + batch_idx * q_stride_b + head_idx * q_stride_h \
+    o_block = O_ptr + batch_idx * q_stride_b + q_head_idx * q_stride_h \
         + (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
     tl.store(o_block, o_i.to(O_ptr.dtype.element_ty), mask=(q_offsets[:, None] < SEQ_LEN))
 
@@ -141,25 +144,30 @@ def flash_attention_forward(q, k, v, is_causal=True):
     """
     Python wrapper for the single-kernel, two-phase causal FlashAttention-2 forward pass
     """
-    assert is_causal, "This implementation is for causal FlashAttention-2."
-    assert q.stride(-1) == k.stride(-1) == v.stride(-1) == 1, "The last stride of q, k, v must all be 1."
+    assert is_causal, "This implementation is for causal FlashAttention-2"
+    assert q.stride(-1) == k.stride(-1) == v.stride(-1) == 1, "The last stride of q, k, v must all be 1"
+    assert k.shape == v.shape, "K and V must have the same shape"
 
-    batch, n_heads, seq_len, head_dim = q.shape
-    assert head_dim >= 16
+    batch, n_q_heads, seq_len, head_dim = q.shape
+    assert head_dim >= 16, "HEAD_DIM must be at least 16"
+    n_kv_heads = k.shape[1]
+    assert n_q_heads % n_kv_heads == 0, "Number of query heads must be divisible by number of KV heads"
     o = torch.empty_like(q)
     softmax_scale = 1 / math.sqrt(head_dim)
     BLOCK_Q, BLOCK_K = 128, 64
-    grid = (triton.cdiv(seq_len, BLOCK_Q), batch * n_heads)
+    assert BLOCK_Q % BLOCK_K == 0, "Query block size must be divisible by K block size"
+    grid = (triton.cdiv(seq_len, BLOCK_Q), batch * n_q_heads)
 
-    _flash_attention_forward_causal_kernel[grid](
+    _flash_attention_forward_gqa_kernel[grid](
         q, k, v, o,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
         softmax_scale=softmax_scale,
         SEQ_LEN=seq_len,
-        N_HEADS=n_heads,
-        HEAD_DIM=head_dim,
+        N_Q_HEADS=n_q_heads,
+        N_KV_HEADS=n_kv_heads,
+        HEAD_DIM=head_dim, 
         BLOCK_Q=BLOCK_Q,
         BLOCK_K=BLOCK_K
     )
